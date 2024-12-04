@@ -1,0 +1,113 @@
+// Streamlined SIO4 HDLC RX Frame with Proper rx->received Handling
+
+#include "main.h"
+
+// Compute the required read size
+static int _compute_read_size(hdlc_device_t* dev) {
+    if (dev->rx.frame_size < 0) {
+        if (dev->rx.on_hand > dev->rx.max_size)
+            return -EOVERFLOW; // Buffer overflow
+
+        dev->rx.get = dev->rx.max_size - dev->rx.on_hand;
+    } else {
+        int need = dev->rx.frame_size - dev->rx.on_hand;
+        dev->rx.get = (need > 0) ? need : 0;
+    }
+    return 0;
+}
+
+// Copy frame data to user buffer and adjust
+static void _finish_frame_copy(hdlc_device_t* dev, sio4_hdlc_rx_frame_t* rx) {
+    int bytes = rx->size;
+    bytes = (bytes > sizeof(rx->buffer)) ? sizeof(rx->buffer) : bytes;
+    bytes = (bytes > dev->rx.on_hand) ? dev->rx.on_hand : bytes;
+
+    if (bytes > 0) {
+        memcpy(rx->buffer, dev->rx.buffer, bytes);
+
+        if (dev->rx.on_hand > bytes) {
+            memmove(dev->rx.buffer, dev->rx.buffer + bytes, dev->rx.on_hand - bytes);
+        }
+
+        dev->rx.on_hand -= bytes;
+    }
+
+    rx->received = bytes;
+}
+
+// Finish the frame
+static int _finish_frame(hdlc_device_t* dev, sio4_hdlc_rx_frame_t* rx) {
+    if (dev->rx.frame_size <= 0) {
+        rx->status = dev->rx.status;
+        rx->received = 0;
+        rx->size = 0;
+    } else if (dev->rx.on_hand >= dev->rx.frame_size) {
+        rx->size = dev->rx.frame_size;
+        _finish_frame_copy(dev, rx);
+        rx->status = dev->rx.status | SIO4_HDLC_RX_STAT_FRAME_FULL;
+    } else {
+        rx->size = dev->rx.frame_size;
+        _finish_frame_copy(dev, rx);
+        rx->status = dev->rx.status | SIO4_HDLC_RX_STAT_ERROR_PART;
+    }
+    return 0;
+}
+
+// Read data into the RX buffer
+static int _read_data(hdlc_device_t* dev) {
+    if (dev->rx.get <= 0)
+        return 0;
+
+    int ret = sio4_read(dev->fd, dev->rx.buffer + dev->rx.on_hand, dev->rx.get);
+    if (ret > 0)
+        dev->rx.on_hand += ret;
+
+    return ret;
+}
+
+// Perform RX operation
+static int _perform_operation(hdlc_device_t* dev, sio4_hdlc_rx_frame_t* rx) {
+    int ret = os_sem_lock(&dev->rx.sem);
+    if (ret != 0)
+        return ret;
+
+    dev->rx.frame_size = -1;
+    dev->rx.status = 0;
+
+    while (1) {
+        if ((ret = _compute_read_size(dev)) < 0)
+            break;
+
+        if ((ret = _read_data(dev)) < 0)
+            break;
+
+        if (dev->rx.frame_size < 0) {
+            // If the frame size is still unknown, set a default.
+            dev->rx.frame_size = dev->rx.on_hand;
+        }
+
+        if (dev->rx.on_hand >= dev->rx.frame_size) {
+            ret = _finish_frame(dev, rx);
+            break;
+        }
+    }
+
+    os_sem_unlock(&dev->rx.sem);
+    return ret;
+}
+
+// Public interface: Receive a frame
+int sio4_hdlc_rx_frame(int fd, sio4_hdlc_rx_frame_t* rx) {
+    hdlc_device_t* dev;
+    int ret;
+
+    if ((ret = hdlc_lib_fd_inc(fd, &dev)) != 0)
+        return ret;
+
+    if ((ret = _args_validate(rx)) == 0) {
+        ret = _perform_operation(dev, rx);
+    }
+
+    hdlc_lib_fd_dec(dev);
+    return ret;
+}
